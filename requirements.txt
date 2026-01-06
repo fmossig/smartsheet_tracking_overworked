@@ -1,0 +1,3 @@
+smartsheet-python-sdk
+python-dotenv
+reportlab
