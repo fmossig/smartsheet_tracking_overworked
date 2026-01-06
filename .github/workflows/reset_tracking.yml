@@ -1,0 +1,139 @@
+name: Reset Tracking System
+
+on:
+  workflow_dispatch:
+    # This creates a manual trigger button in GitHub Actions UI
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: |
+          git config user.name 'GitHub Actions'
+          git config user.email 'actions@github.com'
+          git pull --rebase origin main || git pull origin main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install smartsheet-python-sdk python-dotenv
+
+      - name: Create reset script
+        run: |
+          cat > reset_state.py << 'EOL'
+          import json
+          import smartsheet
+          import os
+          import subprocess
+          from dotenv import load_dotenv
+
+          # Load environment variables
+          load_dotenv()
+          token = os.getenv("SMARTSHEET_TOKEN")
+          if not token:
+              print("Error: SMARTSHEET_TOKEN not found in environment or .env file")
+              exit(1)
+
+          # Sheets to process
+          SHEET_IDS = {
+              "NA": 6141179298008964,
+              "NF": 615755411312516,
+              "NH": 123340632051588,
+              "NP": 3009924800925572,
+              "NT": 2199739350077316,
+              "NV": 8955413669040004,
+              "NM": 4275419734822788,
+          }
+
+          # Fields to track - (date_column, user_column_variations, phase_number)
+          # user_column_variations is a tuple of possible column name variations to try
+          PHASE_FIELDS = [
+              ("Kontrolle", ("K von",), 1),
+              ("BE am", ("BE von",), 2),
+              ("K am", ("K2 von", "K 2 von"), 3),  # Bundle sheets use "K 2 von" (with space)
+              ("C am", ("C von",), 4),
+              ("Reopen C2 am", ("Reopen C2 von",), 5),
+          ]
+
+          # First, reset or create the change history file
+          history_file = "tracking_data/change_history.csv"
+          os.makedirs("tracking_data", exist_ok=True)
+
+          # Create a fresh change history file with headers
+          print("Creating fresh change history file...")
+          with open(history_file, "w", newline="", encoding="utf-8") as f:
+              f.write("Timestamp,Group,RowID,Phase,DateField,Date,User,Marketplace\n")
+
+          print("Connecting to Smartsheet...")
+          # Create a fresh state file that marks all current data as processed
+          client = smartsheet.Smartsheet(token)
+          client.errors_as_exceptions(True)
+          state = {"last_run": "2025-10-18 16:41:12", "processed": {}}
+
+          # Process each sheet
+          for group, sid in SHEET_IDS.items():
+              print(f"Processing sheet {group}...")
+              try:
+                  sheet = client.Sheets.get_sheet(sid)
+                  
+                  # Map column titles to IDs
+                  col_map = {col.title: col.id for col in sheet.columns}
+                  
+                  # Process each row
+                  for row in sheet.rows:
+                      for date_col, _, _ in PHASE_FIELDS:
+                          col_id = col_map.get(date_col)
+                          if not col_id:
+                              continue
+                              
+                          # Find cell with this column ID
+                          for cell in row.cells:
+                              if cell.column_id == col_id and cell.value:
+                                  # Add to processed state with normalized date
+                                  field_key = f"{group}:{row.id}:{date_col}"
+                                  val = cell.value
+                                  if hasattr(val, 'date'):
+                                      val = val.date().isoformat()
+                                  elif hasattr(val, 'isoformat'):
+                                      val = val.isoformat()
+                                  else:
+                                      val = str(val).strip()[:10]
+                                  state["processed"][field_key] = val
+                                  break
+              except Exception as e:
+                  print(f"Error processing sheet {group}: {e}")
+                  continue
+
+          # Save state
+          with open("tracking_data/tracker_state.json", "w") as f:
+              json.dump(state, f)
+
+          print(f"Created state file with {len(state['processed'])} processed items")
+          print("System reset complete - tracking will now only capture new changes")
+          EOL
+
+      - name: Run reset script
+        env:
+          SMARTSHEET_TOKEN: ${{ secrets.SMARTSHEET_TOKEN }}
+        run: |
+          python reset_state.py
+
+      - name: Commit changes
+        run: |
+          git config user.name 'GitHub Actions'
+          git config user.email 'actions@github.com'
+          git add tracking_data/
+          git commit -m "Reset tracking system" || echo "No changes to commit"
+          git pull --rebase origin main || git pull origin main
+          git push
